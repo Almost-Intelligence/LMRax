@@ -1,0 +1,8 @@
+transformers
+datasets
+jax[cuda11_cudnn82]==0.4.4
+torch
+optax
+flax
+hydra-core
+wandb

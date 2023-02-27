@@ -1,0 +1,22 @@
+model_name: model_name_or_path  # to load from huggingface transformers
+epochs: 100                     # total epoch numbers
+seed: 0                         # initial seed
+batch_size_per_device: 1        # how many sentences in a batch
+gradient_accumulation: 1        # gradient accumulation
+reward_token: reward            # which special token should be used as reward
+eval_steps: 1                   # eval every k steps
+save_steps: 1                   # save every k steps
+max_grad_value: 0.1             # maximum gradient value range
+max_length: 1                   # maximum length per batch
+save_dir: /path/to/save
+
+
+hydra:
+  output_subdir: null
+  run:
+    dir: .
+
+default:
+  - _self_
+  - optimizer: optimizer name   # in [adamw]
+  - dataset: dataset name       # in [shp]

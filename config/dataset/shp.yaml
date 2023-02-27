@@ -1,0 +1,5 @@
+name: "stanfordnlp/SHP"
+train: train
+val: "validation"
+test: "test"
+score_ratio: 2.0

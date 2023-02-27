@@ -1,0 +1,6 @@
+name: adamw
+lr: 1.0e-4
+b1: 0.9
+b2: 0.99
+eps: 1.0e-6
+weight_decay: 1.0e-4
