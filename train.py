@@ -9,13 +9,13 @@ import jax.flatten_util
 import jax.numpy as jnp
 import jax.sharding as shd
 import numpy as np
-from omegaconf import OmegaConf
 import optax
 import tqdm
 import transformers
 import wandb
 from flax.core.frozen_dict import freeze, unfreeze
 from jax.experimental.pjit import pjit
+from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 
 import lmrax.optimizers
@@ -118,6 +118,7 @@ def batch_select(batch, idx):
 
 def _eval_fn(params, batch, model):
     weight = batch["weight"]
+    params = jax.tree_map(lambda x: x.astype(jnp.bfloat16), params)
     log_prob_chosen, log_prob_rejected = predict_fn(params, batch, model)
     loss = -jnp.mean(
         weight * log_prob_chosen + (1 - weight) * log_prob_rejected
@@ -332,7 +333,10 @@ class Trainer:
         avg_loss /= len(self.val_loader)
         avg_acc /= len(self.val_loader)
 
-        return {"loss": avg_loss, "acc": avg_acc}
+        return {
+            "loss": jax.device_get(avg_loss),
+            "acc": jax.device_get(avg_acc),
+        }
 
 
 @hydra.main(version_base=None, config_path="config", config_name="tp")
