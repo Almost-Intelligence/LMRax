@@ -1,0 +1,5 @@
+name: lion
+learning_rate: 1.0e-5
+b1: 0.9
+b2: 0.99
+weight_decay: 1.0e-4

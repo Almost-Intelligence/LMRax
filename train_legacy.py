@@ -10,9 +10,9 @@ import jax.numpy as jnp
 import optax
 import tqdm
 import transformers
+import wandb
 from torch.utils.data import DataLoader
 
-import wandb
 from lmrax.datasets.preference_feedback import FlaxDataCollatorForSeq2SeqPF
 from lmrax.datasets.utils import seed_worker, shp_to_pf
 

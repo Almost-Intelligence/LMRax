@@ -9,17 +9,22 @@ import jax.flatten_util
 import jax.numpy as jnp
 import jax.sharding as shd
 import numpy as np
+from omegaconf import OmegaConf
 import optax
 import tqdm
 import transformers
+import wandb
+from flax.core.frozen_dict import freeze, unfreeze
+from jax.experimental.pjit import pjit
 from torch.utils.data import DataLoader
 
-import wandb
+import lmrax.optimizers
 from lmrax.datasets.preference_feedback import FlaxDataCollatorForSeq2SeqPF
 from lmrax.datasets.utils import seed_worker, shp_to_pf
+from lmrax.sharding import get_batch_shardings, get_params_shardings
 
 
-def predict_fn(params, batch, model, reward_id, rng=None):
+def predict_fn(params, batch, model, rng=None):
     if rng is None:
         training = False
         encoder_rng, chosen_rng, rejected_rng = None, None, None
@@ -46,7 +51,7 @@ def predict_fn(params, batch, model, reward_id, rng=None):
         decoder_attention_mask=chosen["attention_mask"],
         train=training,
         dropout_rng=chosen_rng,
-    ).logits[..., reward_id]
+    ).last_hidden_state.sum(axis=-1)
 
     rejected_reward = model.decode(
         params=params,
@@ -56,7 +61,7 @@ def predict_fn(params, batch, model, reward_id, rng=None):
         decoder_attention_mask=rejected["attention_mask"],
         train=training,
         dropout_rng=rejected_rng,
-    ).logits[..., reward_id]
+    ).last_hidden_state.sum(axis=-1)
 
     # mask out paddings
     chosen_reward = jnp.where(
@@ -78,10 +83,10 @@ def predict_fn(params, batch, model, reward_id, rng=None):
     return log_prob_chosen, log_prob_rejected
 
 
-def loss_fn(params, batch, dropout_rng, model, reward_id):
+def loss_fn(params, batch, dropout_rng, model):
     weight = batch["weight"]
     log_prob_chosen, log_prob_rejected = predict_fn(
-        params, batch, model, reward_id, dropout_rng
+        params, batch, model, dropout_rng
     )
     loss = -jnp.mean(
         weight * log_prob_chosen + (1 - weight) * log_prob_rejected
@@ -90,14 +95,16 @@ def loss_fn(params, batch, dropout_rng, model, reward_id):
     return loss
 
 
-def grad_fn(params, batch, rng, model, reward_id):
-    return jax.value_and_grad(loss_fn)(params, batch, rng, model, reward_id)
+def grad_fn(params, batch, rng, model):
+    return jax.value_and_grad(loss_fn)(params, batch, rng, model)
 
 
-def _update_fn(model, optimizer, rng, batch, params, state, reward_id):
+def _update_fn(model, optimizer, rng, batch, params, state):
     _, rng = jax.random.split(rng)
-    loss, grads = grad_fn(params, batch, rng, model, reward_id)
-    # grads = jax.lax.pmean(grads, "batch")
+    params = jax.tree_map(lambda x: x.astype(jnp.bfloat16), params)
+    loss, grads = grad_fn(params, batch, rng, model)
+    grads = jax.tree_map(lambda x: x.astype(jnp.float32), grads)
+    params = jax.tree_map(lambda x: x.astype(jnp.float32), params)
     updates, state = optimizer.update(grads, state, params)
     grad_norm = grad_norm_fn(updates)
     params = optax.apply_updates(params, updates)
@@ -105,22 +112,13 @@ def _update_fn(model, optimizer, rng, batch, params, state, reward_id):
 
 
 @partial(jax.jit, static_argnums=(1,))
-def batch_sharding(batch, n):
-    return jax.tree_map(
-        lambda x: x.reshape(n, x.shape[0] // n, *x.shape[1:]), batch
-    )
-
-
-@partial(jax.jit, static_argnums=(1,))
 def batch_select(batch, idx):
     return jax.tree_map(lambda x: x[idx], batch)
 
 
-def _eval_fn(params, batch, model, reward_id):
+def _eval_fn(params, batch, model):
     weight = batch["weight"]
-    log_prob_chosen, log_prob_rejected = predict_fn(
-        params, batch, model, reward_id
-    )
+    log_prob_chosen, log_prob_rejected = predict_fn(params, batch, model)
     loss = -jnp.mean(
         weight * log_prob_chosen + (1 - weight) * log_prob_rejected
     )
@@ -150,7 +148,6 @@ class Trainer:
         self.steps = 0
         self.epoch = 0
         self.params_updates = 0
-        self.reward_id = self.tokenizer.vocab[cfg.reward_token]
         self.batch_size = cfg.batch_size_per_device
         self.max_length = cfg.max_length
 
@@ -159,7 +156,11 @@ class Trainer:
 
         import jax.sharding as shd
 
-        devices = np.array(jax.devices()).reshape((-1, cfg.num_tp_devices))
+        devices = np.array(jax.devices()).reshape(
+            cfg.num_dp_devices, cfg.num_tp_devices
+        )
+
+        # dp: data parallel, tp: tensor parallel
         self.mesh = shd.Mesh(devices, ("dp", "tp"))
 
         self.train_loader = self.get_dataloader(self.train_ds)
@@ -169,21 +170,7 @@ class Trainer:
 
         self.update_fn = None
         self.eval_fn = None
-
-    def get_shardings(self, pytree):
-        def _to_shardings(x):
-            if not hasattr(x, "ndim") or not hasattr(x, "dtype"):
-                return shd.NamedSharding(self.mesh, shd.PartitionSpec())
-            _spec_tuple = [
-                None,
-            ] * x.ndim
-            if len(_spec_tuple) > 0:
-                _spec_tuple[-1] = "tp"
-
-            p = shd.PartitionSpec(*_spec_tuple)
-            return shd.NamedSharding(self.mesh, p)
-
-        return jax.tree_map(_to_shardings, pytree)
+        self.shard_batch_fn = None
 
     def get_data_collator(self, max_length=None):
         return FlaxDataCollatorForSeq2SeqPF(
@@ -212,8 +199,8 @@ class Trainer:
         with tqdm.tqdm(self.train_loader, desc=f"Epoch {self.epoch}") as bar:
             for batch in bar:
                 self.steps += 1
-                # update_fn args: rng 0, batch 1, params 2, state 3
-                # returns: loss 0, params 1, state 2, grad_norm 3, rng 4
+
+                batch = self.shard_batch_fn(batch)
                 loss, params, state, grad_norm, rng = self.update_fn(
                     rng, batch, params, state
                 )
@@ -250,23 +237,41 @@ class Trainer:
         return params, state, rng
 
     def init(self, params):
-        rng = jax.random.PRNGKey(self.cfg.seed)
-        params = self.model.init_weights(rng, (1, 1), params)
-        params = jax.tree_map(lambda x: np.asarray(x), params)
+        batch = next(iter(self.train_loader))
 
-        self.params_shardings = self.get_shardings(params)
+        params = jax.tree_map(np.asarray, params)
+        params_shardings = freeze(get_params_shardings(self.mesh, params))
+        batch_shardings = get_batch_shardings(self.mesh, batch)
 
-        put_on_device = jax.jit(
+        put_params_on_device = pjit(
             lambda x: x,
-            out_shardings=self.params_shardings,
+            out_axis_resources=params_shardings,
         )
 
-        params = put_on_device(params)
+        self.shard_batch_fn = pjit(
+            lambda x: x,
+            out_axis_resources=batch_shardings,
+        )
+
+        params = put_params_on_device(params)
         state = self.optimizer.init(params)
 
-        self.state_shardings = self.get_shardings(state)
+        # TODO(yongchanghao): this is a hack
+        def get_state_shardings(x):
+            x = unfreeze(x)
+            if isinstance(x, dict):
+                return params_shardings
+            return shd.NamedSharding(self.mesh, shd.PartitionSpec())
 
-        def update_fn(rng, batch, params, state):
+        state_shardings = jax.tree_util.tree_map(
+            get_state_shardings,
+            state,
+            is_leaf=lambda x: isinstance(
+                unfreeze(x), (dict, optax.EmptyState)
+            ),
+        )
+
+        def wrapped_update_fn(rng, batch, params, state):
             return _update_fn(
                 self.model,
                 self.optimizer,
@@ -274,36 +279,35 @@ class Trainer:
                 batch,
                 params,
                 state,
-                self.reward_id,
             )
 
         none_shd = shd.NamedSharding(self.mesh, shd.PartitionSpec())
 
-        self.update_fn = jax.jit(
-            update_fn,
-            in_shardings=(
-                none_shd,
-                none_shd,
-                self.params_shardings,
-                self.state_shardings,
+        self.update_fn = pjit(
+            wrapped_update_fn,
+            in_axis_resources=(
+                none_shd,  # rng
+                batch_shardings,  # batch
+                params_shardings,  # params
+                state_shardings,  # state
             ),
-            out_shardings=(
-                none_shd,
-                self.params_shardings,
-                self.state_shardings,
-                none_shd,
-                none_shd,
+            out_axis_resources=(
+                none_shd,  # loss
+                params_shardings,  # params
+                state_shardings,  # state
+                none_shd,  # grad_norm
+                none_shd,  # rng
             ),
             donate_argnums=(2, 3),
         )
 
-        def eval_fn(params, batch):
-            return _eval_fn(params, batch, self.model, self.reward_id)
+        def wrapped_eval_fn(params, batch):
+            return _eval_fn(params, batch, self.model)
 
-        self.eval_fn = jax.jit(
-            eval_fn,
-            in_shardings=(self.params_shardings, none_shd),
-            out_shardings=(none_shd, none_shd),
+        self.eval_fn = pjit(
+            wrapped_eval_fn,
+            in_axis_resources=(params_shardings, batch_shardings),
+            out_axis_resources=(none_shd, none_shd),
         )
 
         return params, state
@@ -333,7 +337,6 @@ class Trainer:
 
 @hydra.main(version_base=None, config_path="config", config_name="tp")
 def main(cfg):
-
     train_ds = datasets.load_dataset(cfg.dataset.name, split=cfg.dataset.train)
     train_ds = train_ds.filter(
         lambda x: x["score_ratio"] >= cfg.dataset.score_ratio,
@@ -354,25 +357,22 @@ def main(cfg):
         num_proc=mp.cpu_count(),
     )
 
+    optimizer_cfg = OmegaConf.to_object(cfg.optimizer)
+    optimizer_cls = lmrax.optimizers.get(optimizer_cfg.pop("name"))
+
     optimizer = optax.chain(
         optax.clip(cfg.max_grad_value),
-        optax.adamw(
-            cfg.optimizer.lr,
-            b1=cfg.optimizer.b1,
-            b2=cfg.optimizer.b2,
-            eps=cfg.optimizer.eps,
-            weight_decay=cfg.optimizer.weight_decay,
-        ),
+        optimizer_cls(**optimizer_cfg),
     )
     optimizer = optax.MultiSteps(optimizer, cfg.gradient_accumulation)
 
     rng = jax.random.PRNGKey(cfg.seed)
-    model, params = transformers.FlaxAutoModelForSeq2SeqLM.from_pretrained(
+    model, params = transformers.FlaxAutoModel.from_pretrained(
         cfg.model_name,
         _do_init=False,
     )
-    rng = jax.tree_map(lambda x: np.asarray(x), rng)
-    params = jax.tree_map(lambda x: np.asarray(x), params)
+    rng = jax.tree_map(np.asarray, rng)
+    params = jax.tree_map(np.asarray, params)
     params = model.init_weights(rng, (1, 1), params)
 
     trainer = Trainer(
@@ -386,10 +386,9 @@ def main(cfg):
 
     params, state = trainer.init(params)
 
-    wandb.init(project="pf", config=cfg, dir=cfg.save_dir)
+    wandb.init(project="pf", config=OmegaConf.to_object(cfg), dir=cfg.save_dir)
     wandb.define_metric("val/loss", summary="min")
     wandb.define_metric("val/acc", summary="max")
-    wandb.run.config["reward_id"] = trainer.reward_id
     wandb.run.config["train_size"] = len(train_ds)
     wandb.run.config["val_size"] = len(val_ds)
 

@@ -10,6 +10,8 @@ max_grad_value: 0.1             # maximum gradient value range
 max_length: 1                   # maximum length per batch
 save_dir: /path/to/save
 
+num_dp_devices: 2
+num_tp_devices: 2
 
 hydra:
   output_subdir: null

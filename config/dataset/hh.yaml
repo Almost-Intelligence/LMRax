@@ -1,5 +1,5 @@
 name: "stanfordnlp/SHP"
-train: train
-val: "validation"
+train: train[:90%]
+val: validation[90%:]
 test: "test"
 score_ratio: 2.0

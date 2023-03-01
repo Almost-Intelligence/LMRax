@@ -1,10 +1,8 @@
 # Customized
 .vscode/
 wandb/
-config/
+config/*.yaml
 !config/defaults.yaml
-!config/optimizer/
-!config/dataset/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
