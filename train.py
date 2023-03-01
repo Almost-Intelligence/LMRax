@@ -148,7 +148,7 @@ class Trainer:
         self.steps = 0
         self.epoch = 0
         self.params_updates = 0
-        self.batch_size = cfg.batch_size_per_device
+        self.batch_size = cfg.batch_size_per_device * cfg.num_dp_devices
         self.max_length = cfg.max_length
 
         self.params_shardings = None
