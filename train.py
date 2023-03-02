@@ -104,9 +104,9 @@ def _update_fn(model, optimizer, rng, batch, params, state):
     params = jax.tree_map(lambda x: x.astype(jnp.bfloat16), params)
     loss, grads = grad_fn(params, batch, rng, model)
     grads = jax.tree_map(lambda x: x.astype(jnp.float32), grads)
+    grad_norm = grad_norm_fn(grads)
     params = jax.tree_map(lambda x: x.astype(jnp.float32), params)
     updates, state = optimizer.update(grads, state, params)
-    grad_norm = grad_norm_fn(updates)
     params = optax.apply_updates(params, updates)
     return loss, params, state, grad_norm, rng
 
