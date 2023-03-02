@@ -20,7 +20,7 @@ from torch.utils.data import DataLoader
 
 import lmrax.optimizers
 from lmrax.datasets.preference_feedback import FlaxDataCollatorForSeq2SeqPF
-from lmrax.datasets.utils import seed_worker, shp_to_pf
+from lmrax.datasets.utils import seed_worker
 from lmrax.sharding import get_batch_shardings, get_params_shardings
 
 
@@ -342,25 +342,28 @@ class Trainer:
 @hydra.main(version_base=None, config_path="config", config_name="tp")
 def main(cfg):
     train_ds = datasets.load_dataset(cfg.dataset.name, split=cfg.dataset.train)
+    ori_train_len = len(train_ds)
     train_ds = train_ds.filter(
-        lambda x: x["score_ratio"] >= cfg.dataset.score_ratio,
+        lmrax.datasets.utils.get_filter_fn(cfg),
         num_proc=mp.cpu_count(),
     )
     train_ds = train_ds.map(
-        shp_to_pf,
+        lmrax.datasets.utils.get_map_fn(cfg),
         remove_columns=train_ds.features.keys(),
         num_proc=mp.cpu_count(),
+        load_from_cache_file=False,
     )
 
     tokenizer = transformers.AutoTokenizer.from_pretrained(cfg.model_name)
 
     val_ds = datasets.load_dataset(cfg.dataset.name, split=cfg.dataset.val)
+    ori_val_len = len(val_ds)
     val_ds = val_ds.map(
-        shp_to_pf,
+        lmrax.datasets.utils.get_map_fn(cfg),
         remove_columns=val_ds.features.keys(),
         num_proc=mp.cpu_count(),
+        load_from_cache_file=False,
     )
-
     optimizer_cfg = OmegaConf.to_object(cfg.optimizer)
     optimizer_cls = lmrax.optimizers.get(optimizer_cfg.pop("name"))
 
@@ -393,6 +396,8 @@ def main(cfg):
     wandb.init(project="pf", config=OmegaConf.to_object(cfg), dir=cfg.save_dir)
     wandb.define_metric("val/loss", summary="min")
     wandb.define_metric("val/acc", summary="max")
+    wandb.run.config["ori_train_size"] = ori_train_len
+    wandb.run.config["ori_val_size"] = ori_val_len
     wandb.run.config["train_size"] = len(train_ds)
     wandb.run.config["val_size"] = len(val_ds)
 
