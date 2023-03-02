@@ -1,5 +1,5 @@
-name: "stanfordnlp/SHP"
+name: "Anthropic/hh-rlhf"
 train: train[:90%]
-val: validation[90%:]
+val: train[90%:]
 test: "test"
 score_ratio: 2.0
