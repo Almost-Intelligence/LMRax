@@ -60,11 +60,9 @@ def get_batch_shardings(mesh, inputs):
     for k, v in inputs.items():
         if not isinstance(v, np.ndarray) or v.ndim == 0:
             _spec_tuple = []
-        elif "input_ids" in k or "labels" in k or "mask" in k:
+        else:
             _spec_tuple = [None] * (v.ndim)
             _spec_tuple[0] = "dp"
-        else:
-            _spec_tuple = []
         p = shd.PartitionSpec(*_spec_tuple)
         return_dict[k] = shd.NamedSharding(mesh, p)
     return return_dict
