@@ -51,7 +51,7 @@ def predict_fn(params, batch, model, rng=None):
         decoder_attention_mask=chosen["attention_mask"],
         train=training,
         dropout_rng=chosen_rng,
-    ).last_hidden_state.sum(axis=-1)
+    ).last_hidden_state.mean(axis=-1)
 
     rejected_reward = model.decode(
         params=params,
@@ -61,7 +61,7 @@ def predict_fn(params, batch, model, rng=None):
         decoder_attention_mask=rejected["attention_mask"],
         train=training,
         dropout_rng=rejected_rng,
-    ).last_hidden_state.sum(axis=-1)
+    ).last_hidden_state.mean(axis=-1)
 
     # mask out paddings
     chosen_reward = jnp.where(
@@ -127,15 +127,17 @@ def _eval_fn(params, batch, model):
     return loss, acc
 
 
-@jax.jit
 def mean_grads_fn(grads):
     return jax.tree_map(lambda x: jnp.mean(x, axis=0), grads)
 
 
-@jax.jit
 def grad_norm_fn(grads):
-    grads, _ = jax.flatten_util.ravel_pytree(grads)
-    return jnp.linalg.norm(grads)
+    return jnp.sqrt(
+        jax.tree_util.tree_reduce(
+            lambda x, y: x + y,
+            jax.tree_map(lambda x: jnp.linalg.norm(x) ** 2, grads),
+        )
+    )
 
 
 class Trainer:
@@ -367,10 +369,14 @@ def main(cfg):
     optimizer_cfg = OmegaConf.to_object(cfg.optimizer)
     optimizer_cls = lmrax.optimizers.get(optimizer_cfg.pop("name"))
 
-    optimizer = optax.chain(
-        optax.clip(cfg.max_grad_value),
+    optimizer_chains = [
         optimizer_cls(**optimizer_cfg),
-    )
+    ]
+    if cfg.max_grad_norm is not None:
+        optimizer_chains.append(optax.clip_by_global_norm(cfg.max_grad_norm))
+    elif cfg.max_grad_value is not None:
+        optimizer_chains.append(optax.clip(cfg.max_grad_value))
+    optimizer = optax.chain(*optimizer_chains)
     optimizer = optax.MultiSteps(optimizer, cfg.gradient_accumulation)
 
     rng = jax.random.PRNGKey(cfg.seed)
@@ -392,7 +398,9 @@ def main(cfg):
     )
 
     params, state = trainer.init(params)
-
+    num_params = jax.tree_util.tree_reduce(
+        lambda x, y: x + y, jax.tree_map(lambda x: x.size, params)
+    )
     wandb.init(project="pf", config=OmegaConf.to_object(cfg), dir=cfg.save_dir)
     wandb.define_metric("val/loss", summary="min")
     wandb.define_metric("val/acc", summary="max")
@@ -400,6 +408,7 @@ def main(cfg):
     wandb.run.config["ori_val_size"] = ori_val_len
     wandb.run.config["train_size"] = len(train_ds)
     wandb.run.config["val_size"] = len(val_ds)
+    wandb.run.config["num_params"] = format(num_params, ",")
 
     trainer.train(params, state, rng)
     wandb.finish()
